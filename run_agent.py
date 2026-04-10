@@ -2866,10 +2866,83 @@ class AIAgent:
                 default=str,
             )
 
+            # Noosphere native export: write sanitized envelope to shared ingest inbox.
+            # Best-effort — never blocks or fails the primary session save.
+            try:
+                self._export_to_noosphere_inbox(entry)
+            except Exception as _export_err:
+                logging.debug("Noosphere inbox export failed (non-fatal): %s", _export_err)
+
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
-    
+
+    def _export_to_noosphere_inbox(self, entry: dict) -> None:
+        """Export sanitized session envelope to Noosphere shared ingest inbox.
+
+        Writes a versioned, sanitized envelope (user/assistant messages only)
+        to the directory specified by HERMES_NOOSPHERE_INBOX.  Strips
+        system_prompt, tools, base_url, platform and all non-user/assistant
+        messages to prevent internal data leakage.
+
+        Contract: noosphere.ingest.hermes.session.v1
+        Trigger: called after every successful _save_session_log()
+        Failure: logged at DEBUG level, never blocks session persistence.
+        """
+        inbox_dir = os.environ.get("HERMES_NOOSPHERE_INBOX")
+        if not inbox_dir:
+            return
+
+        inbox_path = Path(inbox_dir)
+        if not inbox_path.is_dir():
+            return
+
+        session_id = entry.get("session_id", "")
+        if not session_id:
+            return
+
+        # Sanitize: user/assistant messages only
+        filtered = [
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in entry.get("messages", [])
+            if m.get("role") in ("user", "assistant")
+        ]
+
+        # Source fingerprint from the private store file we just wrote
+        source_mtime, source_size = 0, 0
+        try:
+            if hasattr(self, "session_log_file") and self.session_log_file.exists():
+                st = self.session_log_file.stat()
+                source_mtime = int(st.st_mtime)
+                source_size = st.st_size
+        except OSError as e:
+            logging.debug("Noosphere export: could not stat session log: %s", e)
+
+        envelope = {
+            "contract_version": "noosphere.ingest.hermes.session.v1",
+            "producer": "hermes",
+            "session_id": session_id,
+            "exported_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source_fingerprint": {
+                "mtime": source_mtime,
+                "size": source_size,
+            },
+            "session_start": entry.get("session_start"),
+            "model": entry.get("model"),
+            "message_count": len(filtered),
+            "message_export_policy": "user_assistant_only",
+            "messages": filtered,
+        }
+
+        final_path = inbox_path / f"session_{session_id}.json"
+        atomic_json_write(final_path, envelope)
+
+        # Set group-readable permissions for noosphere consumer
+        try:
+            os.chmod(final_path, 0o640)
+        except OSError as e:
+            logging.debug("Noosphere export: chmod 640 failed for %s: %s", final_path, e)
+
     def interrupt(self, message: str = None) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
