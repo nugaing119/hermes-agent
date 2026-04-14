@@ -27,8 +27,10 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -43,6 +45,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
 )
+from tools.ansi_strip import strip_ansi
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +334,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        review_repo_root = str(extra.get("review_repo_root", os.getenv("API_SERVER_REVIEW_REPO_ROOT", ""))).strip()
+        self._review_repo_root: Optional[Path] = Path(review_repo_root).expanduser() if review_repo_root else None
+        self._review_paths_cache: Optional[Dict[str, Path]] = None
+        self._review_static_dir: Path = Path(__file__).resolve().parent / "review_dashboard"
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -396,6 +403,226 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         return "*" in self._cors_origins or origin in self._cors_origins
+
+    # ------------------------------------------------------------------
+    # Review backend helpers (optional, repo-specific)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dequote(value: str) -> str:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            return value[1:-1]
+        return value
+
+    def _review_available(self) -> bool:
+        return bool(self._review_repo_root and self._review_repo_root.exists())
+
+    def _check_review_available(self) -> Optional["web.Response"]:
+        if not self._review_available():
+            return web.json_response(
+                {"error": "Review backend not configured. Set API_SERVER_REVIEW_REPO_ROOT."},
+                status=501,
+            )
+        return None
+
+    def _run_review_cmd(self, args: List[str]) -> subprocess.CompletedProcess[str]:
+        if not self._review_repo_root:
+            raise RuntimeError("review backend not configured")
+        return subprocess.run(
+            args,
+            cwd=self._review_repo_root,
+            text=True,
+            capture_output=True,
+            env=os.environ.copy(),
+        )
+
+    def _review_bin(self, name: str) -> str:
+        if not self._review_repo_root:
+            raise RuntimeError("review backend not configured")
+        return str(self._review_repo_root / "bin" / name)
+
+    def _resolve_review_paths(self) -> Dict[str, Path]:
+        if self._review_paths_cache is not None:
+            return self._review_paths_cache
+
+        if not self._review_repo_root:
+            raise RuntimeError("review backend not configured")
+
+        env_bin = self._review_bin("noo-env")
+        result_map: Dict[str, Path] = {}
+        for key in ("pending", "maintenance", "override-log"):
+            result = self._run_review_cmd([env_bin, "path", key])
+            if result.returncode == 0 and result.stdout.strip():
+                result_map[key] = Path(result.stdout.strip())
+            else:
+                fallback = {
+                    "pending": self._review_repo_root / "vault" / "_noosphere" / "pending",
+                    "maintenance": self._review_repo_root / "vault" / "_noosphere" / "maintenance",
+                    "override-log": self._review_repo_root / "vault" / "_noosphere" / "overrides" / "events.jsonl",
+                }
+                result_map[key] = fallback[key]
+
+        self._review_paths_cache = result_map
+        return result_map
+
+    def _parse_frontmatter_file(self, path: Path, fallback_id: str) -> Dict[str, Any]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            return {
+                "file_path": str(path),
+                "body": "",
+                fallback_id: path.stem,
+                "parse_error": f"{exc.__class__.__name__}: {exc}",
+            }
+
+        lines = text.splitlines()
+        frontmatter: Dict[str, Any] = {}
+        body = text
+        if lines and lines[0].strip() == "---":
+            body_start = None
+            current_list_key: Optional[str] = None
+            for idx in range(1, len(lines)):
+                line = lines[idx]
+                if line.strip() == "---":
+                    body_start = idx + 1
+                    break
+                if current_list_key and line.startswith("  - "):
+                    frontmatter.setdefault(current_list_key, [])
+                    frontmatter[current_list_key].append(self._dequote(line.split("-", 1)[1].strip()))
+                    continue
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if value == "":
+                        frontmatter[key] = []
+                        current_list_key = key
+                    else:
+                        frontmatter[key] = self._dequote(value)
+                        current_list_key = None
+                else:
+                    current_list_key = None
+            if body_start is not None:
+                body = "\n".join(lines[body_start:]).strip()
+
+        item: Dict[str, Any] = {"file_path": str(path), "body": body}
+        item.update(frontmatter)
+        item[fallback_id] = item.get(fallback_id) or path.stem
+        return item
+
+    @staticmethod
+    def _review_approval_mode(candidate: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+        status = candidate.get("status", "")
+        kind = candidate.get("proposal_kind", "")
+        readiness = candidate.get("promotion_readiness", "")
+
+        if status != "pending":
+            return None, f"status={status}"
+        if kind == "literature":
+            return "approve_literature", None
+        if readiness == "ready":
+            return "approve_auto", None
+        if readiness == "needs_review" and kind in {"permanent_note", "claim", "glossary_term", "hub_page"}:
+            return "approve_claim", None
+        return None, f"readiness={readiness or 'unassessed'}"
+
+    def _list_review_candidates(self, filter_value: str = "all") -> List[Dict[str, Any]]:
+        pending_dir = self._resolve_review_paths()["pending"]
+        if not pending_dir.exists():
+            return []
+        items: List[Dict[str, Any]] = []
+        for path in sorted(pending_dir.glob("*.md")):
+            if path.name == ".gitkeep":
+                continue
+            candidate = self._parse_frontmatter_file(path, "candidate_id")
+            if candidate.get("status", "") != "pending":
+                continue
+            readiness = candidate.get("promotion_readiness", "")
+            if filter_value != "all" and readiness != filter_value:
+                continue
+            mode, reason = self._review_approval_mode(candidate)
+            candidate["approve_mode"] = mode
+            candidate["approve_block_reason"] = reason
+            items.append(candidate)
+        order = {"ready": 0, "needs_review": 1, "blocked": 2, "": 3, "null": 3}
+        items.sort(key=lambda item: (order.get(item.get("promotion_readiness", ""), 9), item.get("created_at", ""), item.get("candidate_id", "")))
+        return items
+
+    def _get_review_candidate(self, candidate_id: str) -> Optional[Dict[str, Any]]:
+        pending_dir = self._resolve_review_paths()["pending"]
+        path = pending_dir / f"{candidate_id}.md"
+        if not path.exists():
+            return None
+        candidate = self._parse_frontmatter_file(path, "candidate_id")
+        mode, reason = self._review_approval_mode(candidate)
+        candidate["approve_mode"] = mode
+        candidate["approve_block_reason"] = reason
+        return candidate
+
+    def _list_review_maintenance(self, status_filter: str = "all") -> List[Dict[str, Any]]:
+        maint_dir = self._resolve_review_paths()["maintenance"]
+        if not maint_dir.exists():
+            return []
+        items: List[Dict[str, Any]] = []
+        for path in sorted(maint_dir.glob("*.md")):
+            if path.name == ".gitkeep":
+                continue
+            item = self._parse_frontmatter_file(path, "maintenance_id")
+            if status_filter != "all" and item.get("status", "") != status_filter:
+                continue
+            items.append(item)
+        status_rank = {"open": 0, "applied": 1, "ignored": 2, "rolled_back": 3}
+        items.sort(key=lambda item: (status_rank.get(item.get("status", ""), 9), item.get("created_at", ""), item.get("maintenance_id", "")))
+        return items
+
+    def _get_review_maintenance(self, maintenance_id: str) -> Optional[Dict[str, Any]]:
+        maint_dir = self._resolve_review_paths()["maintenance"]
+        path = maint_dir / f"{maintenance_id}.md"
+        if not path.exists():
+            return None
+        return self._parse_frontmatter_file(path, "maintenance_id")
+
+    def _list_review_overrides(self, limit: int = 20) -> List[Dict[str, Any]]:
+        log_path = self._resolve_review_paths()["override-log"]
+        if not log_path.exists():
+            return []
+        entries: List[Dict[str, Any]] = []
+        for raw in log_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return list(reversed(entries[-limit:]))
+
+    @staticmethod
+    def _summarize_review_maintenance(items: List[Dict[str, Any]]) -> Dict[str, int]:
+        summary = {"all": 0, "open": 0, "applied": 0, "ignored": 0, "rolled_back": 0}
+        for item in items:
+            summary["all"] += 1
+            status = item.get("status", "")
+            if status in summary:
+                summary[status] += 1
+        return summary
+
+    @staticmethod
+    def _review_asset_content_type(path: Path) -> str:
+        if path.suffix == ".css":
+            return "text/css; charset=utf-8"
+        if path.suffix == ".js":
+            return "application/javascript; charset=utf-8"
+        return "text/html; charset=utf-8"
+
+    def _resolve_review_asset(self, rel: str) -> Path:
+        rel = rel.lstrip("/") or "index.html"
+        target = (self._review_static_dir / rel).resolve()
+        if not str(target).startswith(str(self._review_static_dir.resolve())) or not target.exists():
+            target = self._review_static_dir / "index.html"
+        return target
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -1057,6 +1284,238 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # Review / governance API (optional noosphere backend)
+    # ------------------------------------------------------------------
+
+    async def _handle_review_summary(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        candidates = self._list_review_candidates("all")
+        summary = {"all": 0, "ready": 0, "needs_review": 0, "blocked": 0}
+        for item in candidates:
+            summary["all"] += 1
+            readiness = item.get("promotion_readiness", "")
+            if readiness in summary:
+                summary[readiness] += 1
+        maintenance = self._list_review_maintenance("all")
+        payload = {
+            "ok": True,
+            "candidates": summary,
+            "maintenance": self._summarize_review_maintenance(maintenance),
+            "recent_overrides_count": len(self._list_review_overrides(limit=20)),
+        }
+        return web.json_response(payload)
+
+    async def _handle_review_candidates(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        filter_value = request.query.get("filter", "all")
+        items = self._list_review_candidates(filter_value)
+        return web.json_response({"ok": True, "items": items})
+
+    async def _handle_review_candidate(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        candidate_id = request.match_info["candidate_id"]
+        item = self._get_review_candidate(candidate_id)
+        if item is None:
+            return web.json_response({"ok": False, "error": f"candidate not found: {candidate_id}"}, status=404)
+        return web.json_response({"ok": True, "item": item})
+
+    async def _handle_review_candidate_context(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        candidate_id = request.match_info["candidate_id"]
+        item = self._get_review_candidate(candidate_id)
+        if item is None:
+            return web.json_response({"ok": False, "error": f"candidate not found: {candidate_id}"}, status=404)
+
+        show_cmd = [self._review_bin("noo-promote"), "--show", candidate_id]
+        preflight_cmd = [self._review_bin("noo-promote"), "--preflight", candidate_id]
+        show_result = self._run_review_cmd(show_cmd)
+        preflight_result = self._run_review_cmd(preflight_cmd)
+        payload = {
+            "ok": True,
+            "item": item,
+            "context": {
+                "show_output": strip_ansi(show_result.stdout + show_result.stderr).strip(),
+                "show_exit_code": show_result.returncode,
+                "preflight_output": strip_ansi(preflight_result.stdout + preflight_result.stderr).strip(),
+                "preflight_exit_code": preflight_result.returncode,
+            },
+        }
+        return web.json_response(payload)
+
+    async def _handle_review_maintenance(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        status_filter = request.query.get("status", "all")
+        items = self._list_review_maintenance(status_filter)
+        return web.json_response({"ok": True, "items": items})
+
+    async def _handle_review_maintenance_context(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        maintenance_id = request.match_info["maintenance_id"]
+        item = self._get_review_maintenance(maintenance_id)
+        if item is None:
+            return web.json_response({"ok": False, "error": f"maintenance not found: {maintenance_id}"}, status=404)
+
+        show_cmd = [self._review_bin("noo-maintenance"), "--show", maintenance_id]
+        show_result = self._run_review_cmd(show_cmd)
+        related = [entry for entry in self._list_review_overrides(limit=50) if entry.get("target") == maintenance_id]
+        trace_output = "\n".join(
+            f'{entry.get("created_at", "?")}  {entry.get("event_type", "?")}  {entry.get("reason", "")}'.rstrip()
+            for entry in related
+        )
+        payload = {
+            "ok": True,
+            "item": item,
+            "context": {
+                "show_output": strip_ansi(show_result.stdout + show_result.stderr).strip(),
+                "show_exit_code": show_result.returncode,
+                "trace_output": trace_output.strip(),
+                "trace_count": len(related),
+            },
+        }
+        return web.json_response(payload)
+
+    async def _handle_review_overrides(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        try:
+            limit = int(request.query.get("limit", "20"))
+        except ValueError:
+            return web.json_response({"ok": False, "error": "limit must be an integer"}, status=400)
+        items = self._list_review_overrides(limit=max(1, min(limit, 100)))
+        return web.json_response({"ok": True, "items": items})
+
+    async def _handle_review_action(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        review_err = self._check_review_available()
+        if review_err:
+            return review_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response({"ok": False, "error": "Invalid JSON in request body", "error_code": "validation_failed"}, status=400)
+
+        action = str(body.get("action", "")).strip()
+        target_id = str(body.get("target_id", "")).strip()
+        note = str(body.get("note", "")).strip()
+        session_id = str(body.get("session_id", "")).strip()
+        dry_run = bool(body.get("dry_run", False))
+
+        action_map = {
+            "approve_literature": [self._review_bin("noo-promote"), "--approve-literature"],
+            "approve_claim": [self._review_bin("noo-promote"), "--approve-claim"],
+            "approve_auto": [self._review_bin("noo-promote"), "--approve-auto"],
+            "reject": [self._review_bin("noo-promote"), "--reject"],
+            "revise": [self._review_bin("noo-promote"), "--revise"],
+            "lock": [self._review_bin("noo-promote"), "--lock"],
+            "unlock": [self._review_bin("noo-promote"), "--unlock"],
+            "apply_maintenance": [self._review_bin("noo-promote"), "--apply-maintenance"],
+            "rollback": [self._review_bin("noo-promote"), "--rollback"],
+        }
+
+        cmd: List[str]
+        if action == "approve_safe_batch":
+            cmd = [self._review_bin("noo-start"), "--approve-ready", "--safe-only"]
+            if dry_run:
+                cmd.append("--dry-run")
+        else:
+            if action not in action_map:
+                return web.json_response({"ok": False, "error": f"unknown action: {action}", "error_code": "invalid_action"}, status=400)
+            if not target_id:
+                return web.json_response({"ok": False, "error": "target_id is required", "error_code": "validation_failed"}, status=400)
+            cmd = list(action_map[action])
+            cmd.append(target_id)
+            if dry_run:
+                return web.json_response({"ok": False, "error": f"dry_run not supported for action: {action}", "error_code": "validation_failed"}, status=400)
+
+        if note:
+            cmd.extend(["--note", note])
+        if session_id:
+            cmd.extend(["--session-id", session_id])
+
+        result = self._run_review_cmd(cmd)
+        stdout = strip_ansi(result.stdout).strip()
+        stderr = strip_ansi(result.stderr).strip()
+        ok = result.returncode == 0
+        follow_up = ["bin/noo-post-write --rebuild", "bin/noo-lint --dry-run"] if ok else ["bin/noo-lint --dry-run"]
+        hint = "run post-write rebuild if graph views must refresh" if ok else "inspect stderr and repo-native state before retry"
+        payload = {
+            "ok": ok,
+            "action": action,
+            "target_id": target_id or None,
+            "exit_code": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "hint": hint,
+            "follow_up": follow_up,
+        }
+        if not ok:
+            payload["error_code"] = "action_rejected"
+        return web.json_response(payload, status=200 if ok else 400)
+
+    async def _handle_review_dashboard(self, request: "web.Request") -> "web.Response":
+        target = self._resolve_review_asset("index.html")
+        return web.Response(
+            body=target.read_bytes(),
+            content_type="text/html",
+            charset="utf-8",
+        )
+
+    async def _handle_review_asset(self, request: "web.Request") -> "web.Response":
+        rel_path = request.match_info.get("path", "")
+        target = self._resolve_review_asset(rel_path)
+        content_type = self._review_asset_content_type(target)
+        body = target.read_bytes()
+        if content_type.startswith("text/html"):
+            return web.Response(body=body, content_type="text/html", charset="utf-8")
+        if content_type.startswith("text/css"):
+            return web.Response(body=body, content_type="text/css", charset="utf-8")
+        return web.Response(body=body, content_type="application/javascript", charset="utf-8")
+
+    # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
 
@@ -1701,6 +2160,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # Optional review/governance API (repo-native thin proxy)
+            self._app.router.add_get("/api/review/summary", self._handle_review_summary)
+            self._app.router.add_get("/api/review/candidates", self._handle_review_candidates)
+            self._app.router.add_get("/api/review/candidates/{candidate_id}", self._handle_review_candidate)
+            self._app.router.add_get("/api/review/candidates/{candidate_id}/context", self._handle_review_candidate_context)
+            self._app.router.add_get("/api/review/maintenance", self._handle_review_maintenance)
+            self._app.router.add_get("/api/review/maintenance/{maintenance_id}/context", self._handle_review_maintenance_context)
+            self._app.router.add_get("/api/review/overrides", self._handle_review_overrides)
+            self._app.router.add_post("/api/review/actions/run", self._handle_review_action)
+            self._app.router.add_get("/review", self._handle_review_dashboard)
+            self._app.router.add_get("/review/", self._handle_review_dashboard)
+            self._app.router.add_get("/review/{path:.*}", self._handle_review_asset)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)

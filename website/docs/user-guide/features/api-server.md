@@ -194,6 +194,7 @@ The default bind address (`127.0.0.1`) is for local-only use. Browser access is 
 | `API_SERVER_KEY` | _(none)_ | Bearer token for auth |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
 | `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_REVIEW_REPO_ROOT` | _(none)_ | Optional repo root for review/control endpoints that proxy repo-native commands |
 
 ### config.yaml
 
