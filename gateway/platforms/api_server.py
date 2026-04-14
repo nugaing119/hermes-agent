@@ -337,7 +337,6 @@ class APIServerAdapter(BasePlatformAdapter):
         review_repo_root = str(extra.get("review_repo_root", os.getenv("API_SERVER_REVIEW_REPO_ROOT", ""))).strip()
         self._review_repo_root: Optional[Path] = Path(review_repo_root).expanduser() if review_repo_root else None
         self._review_paths_cache: Optional[Dict[str, Path]] = None
-        self._review_static_dir: Path = Path(__file__).resolve().parent / "review_dashboard"
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -608,21 +607,6 @@ class APIServerAdapter(BasePlatformAdapter):
             if status in summary:
                 summary[status] += 1
         return summary
-
-    @staticmethod
-    def _review_asset_content_type(path: Path) -> str:
-        if path.suffix == ".css":
-            return "text/css; charset=utf-8"
-        if path.suffix == ".js":
-            return "application/javascript; charset=utf-8"
-        return "text/html; charset=utf-8"
-
-    def _resolve_review_asset(self, rel: str) -> Path:
-        rel = rel.lstrip("/") or "index.html"
-        target = (self._review_static_dir / rel).resolve()
-        if not str(target).startswith(str(self._review_static_dir.resolve())) or not target.exists():
-            target = self._review_static_dir / "index.html"
-        return target
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -1496,25 +1480,6 @@ class APIServerAdapter(BasePlatformAdapter):
             payload["error_code"] = "action_rejected"
         return web.json_response(payload, status=200 if ok else 400)
 
-    async def _handle_review_dashboard(self, request: "web.Request") -> "web.Response":
-        target = self._resolve_review_asset("index.html")
-        return web.Response(
-            body=target.read_bytes(),
-            content_type="text/html",
-            charset="utf-8",
-        )
-
-    async def _handle_review_asset(self, request: "web.Request") -> "web.Response":
-        rel_path = request.match_info.get("path", "")
-        target = self._resolve_review_asset(rel_path)
-        content_type = self._review_asset_content_type(target)
-        body = target.read_bytes()
-        if content_type.startswith("text/html"):
-            return web.Response(body=body, content_type="text/html", charset="utf-8")
-        if content_type.startswith("text/css"):
-            return web.Response(body=body, content_type="text/css", charset="utf-8")
-        return web.Response(body=body, content_type="application/javascript", charset="utf-8")
-
     # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
@@ -2169,9 +2134,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/review/maintenance/{maintenance_id}/context", self._handle_review_maintenance_context)
             self._app.router.add_get("/api/review/overrides", self._handle_review_overrides)
             self._app.router.add_post("/api/review/actions/run", self._handle_review_action)
-            self._app.router.add_get("/review", self._handle_review_dashboard)
-            self._app.router.add_get("/review/", self._handle_review_dashboard)
-            self._app.router.add_get("/review/{path:.*}", self._handle_review_asset)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
