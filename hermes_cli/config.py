@@ -1240,6 +1240,14 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "API_SERVER_REVIEW_REPO_ROOT": {
+        "description": "Optional repo root for review/control endpoints exposed by the API server. When set, Hermes can proxy repo-native review/governance commands through the API server.",
+        "prompt": "API server review repo root (optional)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
     "WEBHOOK_ENABLED": {
         "description": "Enable the webhook platform adapter for receiving events from GitHub, GitLab, etc.",
         "prompt": "Enable webhooks (true/false)",
