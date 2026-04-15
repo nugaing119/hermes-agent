@@ -3022,6 +3022,12 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """
     if not (web_dir / "package.json").exists():
         return True
+    # Editable/source installs may already have a built frontend under
+    # hermes_cli/web_dist. In that case, don't force npm on every
+    # dashboard launch, especially for service-managed deployments.
+    built_index = web_dir.parent / "hermes_cli" / "web_dist" / "index.html"
+    if built_index.exists():
+        return True
     import shutil
     npm = shutil.which("npm")
     if not npm:
