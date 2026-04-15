@@ -112,6 +112,42 @@ export const api = {
   searchSessions: (q: string) =>
     fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
 
+  // Noosphere audit surface
+  getNoosphereAuditSummary: () =>
+    fetchJSON<NoosphereAuditSummary>("/api/noosphere/audit/summary"),
+  getNoosphereMaintenance: (status = "all") =>
+    fetchJSON<NoosphereMaintenanceResponse>(`/api/noosphere/audit/maintenance?status=${encodeURIComponent(status)}`),
+  getNoosphereOverrides: (limit = 20) =>
+    fetchJSON<NoosphereOverridesResponse>(`/api/noosphere/audit/overrides?limit=${limit}`),
+  applyNoosphereMaintenance: async (maintenanceId: string, note = "", sessionId = "") => {
+    const token = await getSessionToken();
+    return fetchJSON<NoosphereActionResponse>(
+      `/api/noosphere/audit/maintenance/${encodeURIComponent(maintenanceId)}/apply`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ note, session_id: sessionId }),
+      },
+    );
+  },
+  rollbackNoosphereMaintenance: async (maintenanceId: string, note = "", sessionId = "") => {
+    const token = await getSessionToken();
+    return fetchJSON<NoosphereActionResponse>(
+      `/api/noosphere/audit/maintenance/${encodeURIComponent(maintenanceId)}/rollback`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ note, session_id: sessionId }),
+      },
+    );
+  },
+
   // OAuth provider management
   getOAuthProviders: () =>
     fetchJSON<OAuthProvidersResponse>("/api/providers/oauth"),
@@ -323,6 +359,64 @@ export interface SessionSearchResult {
 
 export interface SessionSearchResponse {
   results: SessionSearchResult[];
+}
+
+export interface NoosphereAuditSummary {
+  available: boolean;
+  repo_root?: string;
+  maintenance: {
+    all: number;
+    open: number;
+    applied: number;
+    ignored: number;
+    rolled_back: number;
+  };
+  recent_overrides_count: number;
+}
+
+export interface NoosphereMaintenanceItem {
+  file_path: string;
+  body: string;
+  maintenance_id: string;
+  kind: string;
+  status: string;
+  summary?: string | null;
+  suggested_action?: string | null;
+  created_at?: string | null;
+  created_by?: string | null;
+  target_notes?: string[];
+  source_refs?: string[];
+  rollback_supported?: boolean | null;
+}
+
+export interface NoosphereMaintenanceResponse {
+  available: boolean;
+  items: NoosphereMaintenanceItem[];
+}
+
+export interface NoosphereOverrideEntry {
+  event_id: string;
+  event_type: string;
+  actor?: string | null;
+  channel?: string | null;
+  target: string;
+  before_snapshot?: string | null;
+  reason?: string | null;
+  created_at: string;
+  related_session_id?: string | null;
+}
+
+export interface NoosphereOverridesResponse {
+  available: boolean;
+  items: NoosphereOverrideEntry[];
+}
+
+export interface NoosphereActionResponse {
+  ok: boolean;
+  maintenance_id: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
 }
 
 // ── OAuth provider types ────────────────────────────────────────────────

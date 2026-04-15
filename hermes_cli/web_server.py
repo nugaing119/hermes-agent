@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -263,6 +264,163 @@ class EnvVarDelete(BaseModel):
 
 class EnvVarReveal(BaseModel):
     key: str
+
+
+class NoosphereMaintenanceAction(BaseModel):
+    note: str = ""
+    session_id: str = ""
+
+
+def _get_noosphere_repo_root() -> Optional[Path]:
+    """Return the configured noosphere repo root when available.
+
+    Priority:
+    1. Explicit NOOSPHERE_REPO_ROOT env var
+    2. Derive from OBSIDIAN_VAULT_ROOT by taking its parent directory
+    """
+    explicit = os.getenv("NOOSPHERE_REPO_ROOT", "").strip()
+    if explicit:
+        root = Path(explicit).expanduser()
+        if root.exists():
+            return root
+
+    vault_root = os.getenv("OBSIDIAN_VAULT_ROOT", "").strip()
+    if vault_root:
+        vault = Path(vault_root).expanduser()
+        if vault.name == "vault":
+            candidate = vault.parent
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _noosphere_paths() -> Optional[dict[str, Path]]:
+    root = _get_noosphere_repo_root()
+    if root is None:
+        return None
+    maint_dir = root / "vault" / "_noosphere" / "maintenance"
+    override_log = root / "vault" / "_noosphere" / "overrides" / "events.jsonl"
+    if not maint_dir.exists() and not override_log.exists():
+        return None
+    return {
+        "root": root,
+        "maintenance": maint_dir,
+        "override_log": override_log,
+    }
+
+
+def _noosphere_parse_frontmatter(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    data: dict[str, Any] = {"file_path": str(path), "body": text}
+    if not lines or lines[0].strip() != "---":
+        return data
+
+    current_list_key: Optional[str] = None
+    body_start = None
+    for idx in range(1, len(lines)):
+        line = lines[idx]
+        if line.strip() == "---":
+            body_start = idx + 1
+            break
+        if current_list_key and line.startswith("  - "):
+            data.setdefault(current_list_key, [])
+            data[current_list_key].append(line.split("-", 1)[1].strip().strip('"').strip("'"))
+            continue
+        if ":" in line:
+            key, raw = line.split(":", 1)
+            key = key.strip()
+            raw = raw.strip()
+            if raw == "":
+                data[key] = []
+                current_list_key = key
+            else:
+                if raw == "null":
+                    value: Any = None
+                elif raw in ("true", "false"):
+                    value = raw == "true"
+                elif len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+                    value = raw[1:-1]
+                else:
+                    value = raw
+                data[key] = value
+                current_list_key = None
+        else:
+            current_list_key = None
+    if body_start is not None:
+        data["body"] = "\n".join(lines[body_start:]).strip()
+    return data
+
+
+def _list_noosphere_maintenance(status_filter: str = "all") -> list[dict[str, Any]]:
+    paths = _noosphere_paths()
+    if not paths:
+        return []
+    maint_dir = paths["maintenance"]
+    if not maint_dir.exists():
+        return []
+
+    items: list[dict[str, Any]] = []
+    for path in sorted(maint_dir.glob("*.md")):
+        if path.name == ".gitkeep":
+            continue
+        item = _noosphere_parse_frontmatter(path)
+        if status_filter != "all" and item.get("status") != status_filter:
+            continue
+        items.append(item)
+
+    rank = {"open": 0, "applied": 1, "ignored": 2, "rolled_back": 3}
+    items.sort(
+        key=lambda item: (
+            rank.get(str(item.get("status") or ""), 9),
+            str(item.get("created_at") or ""),
+            str(item.get("maintenance_id") or ""),
+        )
+    )
+    return items
+
+
+def _summarize_noosphere_maintenance(items: list[dict[str, Any]]) -> dict[str, int]:
+    summary = {"all": 0, "open": 0, "applied": 0, "ignored": 0, "rolled_back": 0}
+    for item in items:
+        summary["all"] += 1
+        status = str(item.get("status") or "")
+        if status in summary:
+            summary[status] += 1
+    return summary
+
+
+def _list_noosphere_overrides(limit: int = 20) -> list[dict[str, Any]]:
+    paths = _noosphere_paths()
+    if not paths:
+        return []
+    log_path = paths["override_log"]
+    if not log_path.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for raw in log_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return list(reversed(entries[-limit:]))
+
+
+def _run_noosphere_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
+    paths = _noosphere_paths()
+    if not paths:
+        raise RuntimeError("noosphere repo root not configured")
+    return subprocess.run(
+        args,
+        cwd=paths["root"],
+        text=True,
+        capture_output=True,
+        env=os.environ.copy(),
+    )
 
 
 @app.get("/api/status")
@@ -1484,6 +1642,110 @@ async def delete_session_endpoint(session_id: str):
         return {"ok": True}
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Noosphere audit endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/noosphere/audit/summary")
+async def get_noosphere_audit_summary():
+    paths = _noosphere_paths()
+    if not paths:
+        return {
+            "available": False,
+            "maintenance": {"all": 0, "open": 0, "applied": 0, "ignored": 0, "rolled_back": 0},
+            "recent_overrides_count": 0,
+        }
+
+    maintenance = _list_noosphere_maintenance("all")
+    overrides = _list_noosphere_overrides(limit=20)
+    return {
+        "available": True,
+        "repo_root": str(paths["root"]),
+        "maintenance": _summarize_noosphere_maintenance(maintenance),
+        "recent_overrides_count": len(overrides),
+    }
+
+
+@app.get("/api/noosphere/audit/maintenance")
+async def get_noosphere_maintenance(status: str = "all"):
+    paths = _noosphere_paths()
+    if not paths:
+        return {"available": False, "items": []}
+    if status not in {"all", "open", "applied", "ignored", "rolled_back"}:
+        raise HTTPException(status_code=400, detail=f"Invalid status filter: {status}")
+    return {"available": True, "items": _list_noosphere_maintenance(status)}
+
+
+@app.get("/api/noosphere/audit/overrides")
+async def get_noosphere_overrides(limit: int = 20):
+    paths = _noosphere_paths()
+    if not paths:
+        return {"available": False, "items": []}
+    limit = max(1, min(limit, 100))
+    return {"available": True, "items": _list_noosphere_overrides(limit)}
+
+
+@app.post("/api/noosphere/audit/maintenance/{maintenance_id}/apply")
+async def apply_noosphere_maintenance(maintenance_id: str, body: NoosphereMaintenanceAction, request: Request):
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {_SESSION_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    paths = _noosphere_paths()
+    if not paths:
+        raise HTTPException(status_code=501, detail="Noosphere repo root not configured")
+
+    cmd = [str(paths["root"] / "bin" / "noo-promote"), "--apply-maintenance", maintenance_id]
+    if body.note.strip():
+        cmd.extend(["--note", body.note.strip()])
+    if body.session_id.strip():
+        cmd.extend(["--session-id", body.session_id.strip()])
+
+    result = _run_noosphere_cmd(cmd)
+    ok = result.returncode == 0
+    payload = {
+        "ok": ok,
+        "maintenance_id": maintenance_id,
+        "exit_code": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+    if not ok:
+        raise HTTPException(status_code=400, detail=payload)
+    return payload
+
+
+@app.post("/api/noosphere/audit/maintenance/{maintenance_id}/rollback")
+async def rollback_noosphere_maintenance(maintenance_id: str, body: NoosphereMaintenanceAction, request: Request):
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {_SESSION_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    paths = _noosphere_paths()
+    if not paths:
+        raise HTTPException(status_code=501, detail="Noosphere repo root not configured")
+
+    cmd = [str(paths["root"] / "bin" / "noo-promote"), "--rollback", maintenance_id]
+    if body.note.strip():
+        cmd.extend(["--note", body.note.strip()])
+    if body.session_id.strip():
+        cmd.extend(["--session-id", body.session_id.strip()])
+
+    result = _run_noosphere_cmd(cmd)
+    ok = result.returncode == 0
+    payload = {
+        "ok": ok,
+        "maintenance_id": maintenance_id,
+        "exit_code": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+    if not ok:
+        raise HTTPException(status_code=400, detail=payload)
+    return payload
 
 
 # ---------------------------------------------------------------------------
