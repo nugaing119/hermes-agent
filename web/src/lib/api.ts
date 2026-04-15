@@ -117,6 +117,10 @@ export const api = {
     fetchJSON<NoosphereAuditSummary>("/api/noosphere/audit/summary"),
   getNoosphereMaintenance: (status = "all") =>
     fetchJSON<NoosphereMaintenanceResponse>(`/api/noosphere/audit/maintenance?status=${encodeURIComponent(status)}`),
+  getNoosphereMaintenanceItem: (maintenanceId: string) =>
+    fetchJSON<{ available: boolean; item: NoosphereMaintenanceItem }>(
+      `/api/noosphere/audit/maintenance/${encodeURIComponent(maintenanceId)}`,
+    ),
   getNoosphereOverrides: (limit = 20) =>
     fetchJSON<NoosphereOverridesResponse>(`/api/noosphere/audit/overrides?limit=${limit}`),
   applyNoosphereMaintenance: async (maintenanceId: string, note = "", sessionId = "") => {
@@ -384,6 +388,7 @@ export interface NoosphereMaintenanceItem {
   suggested_action?: string | null;
   created_at?: string | null;
   created_by?: string | null;
+  run_id?: string | null;
   target_notes?: string[];
   source_refs?: string[];
   rollback_supported?: boolean | null;

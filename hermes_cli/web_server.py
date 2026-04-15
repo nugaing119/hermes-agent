@@ -1679,6 +1679,17 @@ async def get_noosphere_maintenance(status: str = "all"):
     return {"available": True, "items": _list_noosphere_maintenance(status)}
 
 
+@app.get("/api/noosphere/audit/maintenance/{maintenance_id}")
+async def get_noosphere_maintenance_item(maintenance_id: str):
+    paths = _noosphere_paths()
+    if not paths:
+        raise HTTPException(status_code=501, detail="Noosphere repo root not configured")
+    item_path = paths["maintenance"] / f"{maintenance_id}.md"
+    if not item_path.exists():
+        raise HTTPException(status_code=404, detail="Maintenance artifact not found")
+    return {"available": True, "item": _noosphere_parse_frontmatter(item_path)}
+
+
 @app.get("/api/noosphere/audit/overrides")
 async def get_noosphere_overrides(limit: int = 20):
     paths = _noosphere_paths()

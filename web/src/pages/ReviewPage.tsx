@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { History, RefreshCw, RotateCcw, Shield, Wrench } from "lucide-react";
+import { Eye, History, RefreshCw, RotateCcw, Shield, Wrench } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   NoosphereActionResponse,
@@ -36,6 +36,14 @@ function formatTime(iso?: string | null): string {
   } catch {
     return iso;
   }
+}
+
+function extractNotesPreview(body?: string | null): string {
+  if (!body) return "";
+  const marker = "## Notes";
+  const idx = body.indexOf(marker);
+  const text = idx >= 0 ? body.slice(idx + marker.length) : body;
+  return text.trim().slice(0, 260);
 }
 
 function SummaryStat({
@@ -90,6 +98,9 @@ export default function ReviewPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [actioning, setActioning] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<NoosphereActionResponse | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedItem, setSelectedItem] = useState<NoosphereMaintenanceItem | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const { toast, showToast } = useToast();
 
   const load = async (filter: StatusFilter, silent = false) => {
@@ -118,6 +129,19 @@ export default function ReviewPage() {
   useEffect(() => {
     load(statusFilter);
   }, [statusFilter]);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setSelectedItem(null);
+      return;
+    }
+    setDetailLoading(true);
+    api
+      .getNoosphereMaintenanceItem(selectedId)
+      .then((resp) => setSelectedItem(resp.item))
+      .catch((err) => showToast(`Failed to load detail: ${err}`, "error"))
+      .finally(() => setDetailLoading(false));
+  }, [selectedId]);
 
   const openCount = summary?.maintenance.open ?? 0;
   const filteredLabel = useMemo(() => {
@@ -187,7 +211,7 @@ export default function ReviewPage() {
         </CardContent>
       </Card>
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(360px,1fr)]">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="flex items-center gap-2 text-base">
@@ -241,6 +265,13 @@ export default function ReviewPage() {
                       <div>Author: {item.created_by || "—"}</div>
                     </div>
 
+                    {extractNotesPreview(item.body) && (
+                      <div className="border border-border px-3 py-2 text-xs text-foreground/75">
+                        {extractNotesPreview(item.body)}
+                        {item.body.length > 260 && <span className="text-muted-foreground">...</span>}
+                      </div>
+                    )}
+
                     {item.target_notes && item.target_notes.length > 0 && (
                       <div className="text-xs">
                         <div className="mb-1 font-display uppercase tracking-[0.12em] text-muted-foreground">
@@ -254,14 +285,14 @@ export default function ReviewPage() {
                       </div>
                     )}
 
-                    <details className="border border-border px-3 py-2">
-                      <summary className="cursor-pointer font-display text-[0.72rem] uppercase tracking-[0.12em] text-muted-foreground">
-                        Details
-                      </summary>
-                      <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs text-foreground/80">
-                        {item.body}
-                      </pre>
-                    </details>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setSelectedId(item.maintenance_id)}
+                    >
+                      <Eye className="h-3 w-3" />
+                      Inspect
+                    </Button>
 
                     {canAct && (
                       <div className="flex flex-wrap gap-2">
@@ -295,17 +326,54 @@ export default function ReviewPage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <History className="h-4 w-4" />
-              Recent Overrides
+              {selectedId ? <Eye className="h-4 w-4" /> : <History className="h-4 w-4" />}
+              {selectedId ? "Maintenance Detail" : "Recent Overrides"}
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            {overrides.length === 0 && (
+            {selectedId ? (
+              detailLoading ? (
+                <div className="flex items-center justify-center py-12">
+                  <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                </div>
+              ) : selectedItem ? (
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={STATUS_VARIANT[selectedItem.status] ?? "outline"}>{selectedItem.status}</Badge>
+                    <Badge variant="outline">{selectedItem.kind}</Badge>
+                    <span className="font-mono-ui text-[0.72rem] text-muted-foreground">
+                      {selectedItem.maintenance_id}
+                    </span>
+                  </div>
+                  <div className="text-sm font-medium">{selectedItem.summary || "Untitled maintenance artifact"}</div>
+                  <div className="text-xs text-muted-foreground">
+                    <div>Created: {formatTime(selectedItem.created_at)}</div>
+                    <div>Author: {selectedItem.created_by || "—"}</div>
+                    {selectedItem.run_id && <div>Run: {selectedItem.run_id}</div>}
+                  </div>
+                  {selectedItem.suggested_action && (
+                    <div className="border border-border px-3 py-2 text-sm text-foreground/85">
+                      {selectedItem.suggested_action}
+                    </div>
+                  )}
+                  <pre className="overflow-x-auto whitespace-pre-wrap border border-border px-3 py-3 text-xs text-foreground/80">
+                    {selectedItem.body}
+                  </pre>
+                  <Button size="sm" variant="outline" onClick={() => setSelectedId(null)}>
+                    Back to Overrides
+                  </Button>
+                </div>
+              ) : (
+                <div className="border border-border px-4 py-6 text-sm text-muted-foreground">
+                  Maintenance artifact not found.
+                </div>
+              )
+            ) : overrides.length === 0 ? (
               <div className="border border-border px-4 py-6 text-sm text-muted-foreground">
                 No override trace entries.
               </div>
-            )}
-            {overrides.map((item) => (
+            ) : (
+              overrides.map((item) => (
               <div key={item.event_id} className="border border-border px-3 py-3">
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <Badge variant={EVENT_VARIANT[item.event_type] ?? "outline"}>{item.event_type}</Badge>
@@ -313,10 +381,12 @@ export default function ReviewPage() {
                 </div>
                 <div className="text-xs text-muted-foreground">
                   <div>{formatTime(item.created_at)}</div>
+                  {item.related_session_id && <div className="mt-1">session: {item.related_session_id}</div>}
                   {item.reason && <div className="mt-1 text-foreground/80">{item.reason}</div>}
                 </div>
               </div>
-            ))}
+              ))
+            )}
           </CardContent>
         </Card>
       </div>
