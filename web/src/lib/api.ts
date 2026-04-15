@@ -118,7 +118,7 @@ export const api = {
   getNoosphereMaintenance: (status = "all") =>
     fetchJSON<NoosphereMaintenanceResponse>(`/api/noosphere/audit/maintenance?status=${encodeURIComponent(status)}`),
   getNoosphereMaintenanceItem: (maintenanceId: string) =>
-    fetchJSON<{ available: boolean; item: NoosphereMaintenanceItem }>(
+    fetchJSON<{ available: boolean; item: NoosphereMaintenanceItem; context: NoosphereMaintenanceContext }>(
       `/api/noosphere/audit/maintenance/${encodeURIComponent(maintenanceId)}`,
     ),
   getNoosphereOverrides: (limit = 20) =>
@@ -399,6 +399,14 @@ export interface NoosphereMaintenanceResponse {
   items: NoosphereMaintenanceItem[];
 }
 
+export interface NoosphereTargetNoteSummary {
+  artifact_id: string;
+  file_path: string;
+  title: string;
+  artifact_kind?: string | null;
+  review_status?: string | null;
+}
+
 export interface NoosphereOverrideEntry {
   event_id: string;
   event_type: string;
@@ -414,6 +422,11 @@ export interface NoosphereOverrideEntry {
 export interface NoosphereOverridesResponse {
   available: boolean;
   items: NoosphereOverrideEntry[];
+}
+
+export interface NoosphereMaintenanceContext {
+  target_note_summaries: NoosphereTargetNoteSummary[];
+  related_overrides: NoosphereOverrideEntry[];
 }
 
 export interface NoosphereActionResponse {

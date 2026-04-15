@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import type {
   NoosphereActionResponse,
   NoosphereAuditSummary,
+  NoosphereMaintenanceContext,
   NoosphereMaintenanceItem,
   NoosphereOverrideEntry,
 } from "@/lib/api";
@@ -100,6 +101,7 @@ export default function ReviewPage() {
   const [lastResult, setLastResult] = useState<NoosphereActionResponse | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<NoosphereMaintenanceItem | null>(null);
+  const [selectedContext, setSelectedContext] = useState<NoosphereMaintenanceContext | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const { toast, showToast } = useToast();
 
@@ -133,12 +135,16 @@ export default function ReviewPage() {
   useEffect(() => {
     if (!selectedId) {
       setSelectedItem(null);
+      setSelectedContext(null);
       return;
     }
     setDetailLoading(true);
     api
       .getNoosphereMaintenanceItem(selectedId)
-      .then((resp) => setSelectedItem(resp.item))
+      .then((resp) => {
+        setSelectedItem(resp.item);
+        setSelectedContext(resp.context);
+      })
       .catch((err) => showToast(`Failed to load detail: ${err}`, "error"))
       .finally(() => setDetailLoading(false));
   }, [selectedId]);
@@ -356,9 +362,46 @@ export default function ReviewPage() {
                       {selectedItem.suggested_action}
                     </div>
                   )}
+                  {selectedContext?.target_note_summaries && selectedContext.target_note_summaries.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <div className="font-display text-[0.72rem] uppercase tracking-[0.12em] text-muted-foreground">
+                        Target Notes
+                      </div>
+                      {selectedContext.target_note_summaries.map((note) => (
+                        <div key={note.artifact_id} className="border border-border px-3 py-2 text-xs">
+                          <div className="mb-1 flex flex-wrap items-center gap-2">
+                            <Badge variant="outline">{note.artifact_kind || "note"}</Badge>
+                            {note.review_status && <Badge variant="outline">{note.review_status}</Badge>}
+                            <span className="font-mono-ui text-muted-foreground">{note.artifact_id}</span>
+                          </div>
+                          <div className="font-medium text-foreground/90">{note.title}</div>
+                          <div className="mt-1 text-muted-foreground">{note.file_path}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <pre className="overflow-x-auto whitespace-pre-wrap border border-border px-3 py-3 text-xs text-foreground/80">
                     {selectedItem.body}
                   </pre>
+                  {selectedContext?.related_overrides && selectedContext.related_overrides.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <div className="font-display text-[0.72rem] uppercase tracking-[0.12em] text-muted-foreground">
+                        Related Trace
+                      </div>
+                      {selectedContext.related_overrides.map((entry) => (
+                        <div key={entry.event_id} className="border border-border px-3 py-2 text-xs">
+                          <div className="mb-1 flex flex-wrap items-center gap-2">
+                            <Badge variant={EVENT_VARIANT[entry.event_type] ?? "outline"}>{entry.event_type}</Badge>
+                            <span className="font-mono-ui text-muted-foreground">{formatTime(entry.created_at)}</span>
+                          </div>
+                          {entry.related_session_id && (
+                            <div className="text-muted-foreground">session: {entry.related_session_id}</div>
+                          )}
+                          {entry.reason && <div className="mt-1 text-foreground/85">{entry.reason}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <Button size="sm" variant="outline" onClick={() => setSelectedId(null)}>
                     Back to Overrides
                   </Button>

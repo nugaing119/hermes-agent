@@ -423,6 +423,37 @@ def _run_noosphere_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _find_noosphere_note_by_artifact(artifact_id: str) -> Optional[dict[str, Any]]:
+    paths = _noosphere_paths()
+    if not paths or not artifact_id:
+        return None
+
+    note_dirs = [
+        paths["root"] / "vault" / "1 Literature",
+        paths["root"] / "vault" / "2 Permanent",
+        paths["root"] / "vault" / "3 Archive",
+        paths["root"] / "vault" / "_glossary",
+        paths["root"] / "vault" / "_noosphere" / "policy",
+    ]
+
+    for directory in note_dirs:
+        if not directory.exists():
+            continue
+        for path in directory.glob("*.md"):
+            item = _noosphere_parse_frontmatter(path)
+            if item.get("artifact_id") != artifact_id:
+                continue
+            title = str(item.get("claim") or item.get("summary") or path.stem)
+            return {
+                "artifact_id": artifact_id,
+                "file_path": str(path),
+                "title": title,
+                "artifact_kind": item.get("artifact_kind"),
+                "review_status": item.get("review_status"),
+            }
+    return None
+
+
 @app.get("/api/status")
 async def get_status():
     current_ver, latest_ver = check_config_version()
@@ -1687,7 +1718,24 @@ async def get_noosphere_maintenance_item(maintenance_id: str):
     item_path = paths["maintenance"] / f"{maintenance_id}.md"
     if not item_path.exists():
         raise HTTPException(status_code=404, detail="Maintenance artifact not found")
-    return {"available": True, "item": _noosphere_parse_frontmatter(item_path)}
+    item = _noosphere_parse_frontmatter(item_path)
+    target_note_summaries = []
+    for target in item.get("target_notes", []) or []:
+        note = _find_noosphere_note_by_artifact(str(target))
+        if note:
+            target_note_summaries.append(note)
+    related_overrides = [
+        entry for entry in _list_noosphere_overrides(limit=50)
+        if entry.get("target") == maintenance_id
+    ]
+    return {
+        "available": True,
+        "item": item,
+        "context": {
+            "target_note_summaries": target_note_summaries,
+            "related_overrides": related_overrides,
+        },
+    }
 
 
 @app.get("/api/noosphere/audit/overrides")
